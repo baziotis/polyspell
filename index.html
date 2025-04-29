@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html lang="el-polyton">
+
+<head>
+  <meta charset="UTF-8">
+  <title>Greek Polytonic Spellchecker</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Josefin+Sans:ital,wght@0,100..700;1,100..700&display=swap"
+    rel="stylesheet">
+  <style>
+    @font-face {
+      font-family: 'GFS Didot';
+      src: url('../fonts/GFSDidot-Regular.woff2') format('woff2'),
+        url('../fonts/GFSDidot-Regular.woff') format('woff'),
+        url('../fonts/GFSDidot-Regular.ttf') format('truetype');
+      font-style: normal;
+      font-weight: 400;
+      font-display: swap;
+    }
+
+    html,
+    body {
+      font-family: "GFS Didot", "Alegreya", serif !important;
+      -webkit-font-smoothing: antialiased;
+      text-rendering: optimizeLegibility;
+      padding: 2rem;
+      max-width: 700px;
+      margin: auto;
+    }
+
+    h1 {
+      font-size: 1.5rem;
+      margin-bottom: 1rem;
+    }
+
+    #editor {
+      display: none;
+      border: 1px solid #ccc;
+      border-radius: 6px;
+      padding: 0.5rem;
+      font-size: 1rem;
+      line-height: 1.5;
+      min-height: 150px;
+      white-space: pre-wrap;
+      outline: none;
+    }
+
+    .misspelled {
+      background-color: #ffdddd;
+      color: red;
+      font-weight: bold;
+      cursor: pointer;
+    }
+
+    .misspelled2 {
+      background-color: #ffdddd;
+      color: red;
+      font-weight: bold;
+    }
+
+    .context-menu {
+      position: absolute;
+      background: white;
+      border: 1px solid #ccc;
+      box-shadow: 0 2px 5px rgba(0, 0, 0, 0.2);
+      padding: 4px 0;
+      margin: 0;
+      font-size: 0.85rem;
+      z-index: 10;
+      display: none;
+      max-width: 200px;
+      line-height: 1.4;
+    }
+
+    .context-menu div {
+      padding: 5px 10px;
+      cursor: pointer;
+    }
+
+    .context-menu div:hover {
+      background-color: #f0f0f0;
+    }
+
+    #status {
+      margin-top: 1rem;
+      font-size: 3em;
+      color: #888;
+    }
+
+    #instructions {
+      display: none;
+    }
+
+    [contenteditable=true]:empty:before {
+      content: attr(placeholder);
+      pointer-events: none;
+      display: block;
+      color: #888;
+    }
+  </style>
+</head>
+
+<body>
+  <h1>Ἐλεγκτὴς Τονισμοῦ γιὰ Πολυτονικὸ Κείμενο Νέων Ἑλληνικῶν</h1>
+
+  <p id="status">📚 Φορτώνει…</p>
+  <p id="instructions">Ὁ διορθωτὴς ἐπισημαίνει μὲ <span class="misspelled2">κόκκινο</span> τὶς λέξεις ποὺ δὲν ἀναγνωρίζει.
+    Πατῆστε δεξὶ κλὶκ πάνω ἀπὸ μιὰ κόκκινη λέξη γιὰ νὰ σᾶς προτείνῃ διορθώσεις.</p>
+  <div id="editor" contenteditable="true" spellcheck="false" placeholder="Εἰσάγετε τὸ πολυτονικό σας κείμενο…"></div>
+  <div id="hoverMenu" class="context-menu"></div>
+
+  <script src="https://cdn.jsdelivr.net/npm/typo-js@1.2.5/typo.min.js"></script>
+  <script>
+    let dictionary;
+    let pendingResults = new Map();
+    let pendingPromises = new Map();
+    const worker = new Worker('worker3.js', { type: 'module' });
+    let maxSuggestions = 5;
+
+    async function loadDictionary() {
+      try {
+        // TODO: It would be great if we could use nspell here because it may have faster loading times.
+        // But it's packaged in a way that we can't easily include it.
+        const aff = await fetch('el_GR.aff').then(r => r.text());
+        const dic = await fetch('el_GR.dic').then(r => r.text());
+        dictionary = new Typo('el_GR', aff, dic);
+        document.getElementById('status').style.display = 'none';
+        document.getElementById('editor').style.display = 'block';
+        document.getElementById('instructions').style.display = 'block';
+        highlightMisspellings();
+      } catch (e) {
+        document.getElementById('status').textContent = '❌ Failed to load dictionary.';
+        console.error(e);
+      }
+    }
+
+    worker.onmessage = function (e) {
+      const { w, sugg } = e.data;
+      pendingResults.get(w)(sugg);  // Resolve the Promise
+    };
+
+    function sendMessage(w) {
+      return new Promise((resolve) => {
+        pendingResults.set(w, resolve);
+        worker.postMessage(w);
+      });
+    }
+
+    // document.getElementById('editor').addEventListener('input', highlightMisspellings);
+
+    let debounceTimer = null;
+    let debounceLatency = 250;
+    document.getElementById('editor').addEventListener('keypress', handleKeyPress);
+    document.getElementById('editor').addEventListener('keyup', handleKeyUp);
+
+
+    function handleKeyUp(_e) {
+      window.clearTimeout(debounceTimer);
+      debounceTimer = window.setTimeout(highlightMisspellings, debounceLatency);
+    }
+
+    function handleKeyPress(_e) {
+      window.clearTimeout(debounceTimer);
+    }
+
+
+    diacritics = new Set(["´", "`", "᾽", "῾", "῎", "῞", "᾽`", "῝", "῀", "῏", "῟", "¨", "΅", "ι", "῀ι"]);
+
+    function highlightMisspellings() {
+      if (!dictionary) return;
+
+      const editor = document.getElementById('editor');
+      const text = editor.innerText;
+      const tokens = text.match(/[\p{L}]+|[^\p{L}\s]/gu) || [];
+      let index = 0;
+      let highlighted = '';
+
+      diacriticAlone = false;
+      for (const token of tokens) {
+        if (diacritics.has(token)) {
+          diacriticAlone = true;
+        }
+        const i = text.indexOf(token, index);
+        const before = text.slice(index, i);
+        const isWord = /^\p{L}+$/u.test(token);
+
+        highlighted += escapeHtml(before);
+
+        if (isWord && !dictionary.check(token)) {
+          highlighted += `<span class="misspelled" data-word="${token}">${escapeHtml(token)}</span>`;
+          pendingPromises.set(token, sendMessage(token));
+        } else {
+          highlighted += escapeHtml(token);
+        }
+
+        index = i + token.length;
+      }
+
+      if (!diacriticAlone) {
+        highlighted += escapeHtml(text.slice(index));
+        const caretPos = saveCaretPosition(editor);
+        editor.innerHTML = highlighted;
+        restoreCaretPosition(editor, caretPos);
+      }
+
+      const elements = document.querySelectorAll('.misspelled');
+
+      elements.forEach(el => {
+        if (document.addEventListener) {
+          el.addEventListener('contextmenu', rightClickAction);
+        } else {
+          el.attachEvent('oncontextmenu', rightClickAction);
+        }
+      });
+    }
+
+    function escapeHtml(text) {
+      return text.replace(/[&<>"']/g, tag => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;',
+        '"': '&quot;', "'": '&#39;'
+      }[tag]));
+    }
+
+    function saveCaretPosition(containerEl) {
+      const sel = window.getSelection();
+      if (!sel.rangeCount) return null;
+
+      const range = sel.getRangeAt(0);
+      const preCaretRange = range.cloneRange();
+      preCaretRange.selectNodeContents(containerEl);
+      preCaretRange.setEnd(range.startContainer, range.startOffset);
+      const caretOffset = preCaretRange.toString().length;
+      return caretOffset;
+    }
+
+    function restoreCaretPosition(containerEl, offset) {
+      let currentOffset = 0;
+      const nodeStack = [containerEl];
+      let node, found = false;
+      let range = document.createRange();
+
+      while (nodeStack.length && !found) {
+        node = nodeStack.pop();
+
+        if (node.nodeType === 3) {
+          const nextOffset = currentOffset + node.length;
+          if (offset <= nextOffset) {
+            range.setStart(node, offset - currentOffset);
+            range.collapse(true);
+            found = true;
+          }
+          currentOffset = nextOffset;
+        } else {
+          let i = node.childNodes.length;
+          while (i--) {
+            nodeStack.push(node.childNodes[i]);
+          }
+        }
+      }
+
+      if (found) {
+        const sel = window.getSelection();
+        sel.removeAllRanges();
+        sel.addRange(range);
+      }
+    }
+
+
+
+    function sleep(ms) {
+      return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+
+    async function rightClickAction(e) {
+      e.preventDefault();
+      target = e.target;
+      const w = target.textContent;
+      const wSuggestions = await pendingPromises.get(w);
+      showHoverMenu(e, wSuggestions, e.pageX, e.pageY);
+    }
+
+    document.getElementById('editor').addEventListener('click', function (e) {
+      if (!e.relatedTarget || !e.relatedTarget.classList.contains('context-menu')) {
+        hideHoverMenu();
+      }
+    });
+
+    function showHoverMenu(e, suggestions, x, y) {
+      const menu = document.getElementById('hoverMenu');
+      menu.innerHTML = '';
+
+      if (suggestions.length === 0) {
+        const div = document.createElement('div');
+        div.textContent = 'Δὲν ὑπάρχουν προτάσεις.';
+        menu.appendChild(div);
+      } else {
+        suggestions.slice(0, maxSuggestions).forEach(suggestion => {
+          const div = document.createElement('div');
+          div.textContent = suggestion;
+          div.onclick = () => applySuggestion(e, suggestion);
+          menu.appendChild(div);
+        });
+      }
+
+      menu.style.top = `${y + 10}px`;
+      menu.style.left = `${x + 10}px`;
+      menu.style.display = 'block';
+    }
+
+    function hideHoverMenu() {
+      const menu = document.getElementById('hoverMenu');
+      menu.style.display = 'none';
+    }
+
+    function applySuggestion(e, replacement) {
+      const editor = document.getElementById('editor');
+      const caretPos = saveCaretPosition(editor);
+      previousLen = (e.target.innerText.length);
+      e.target.textContent = replacement;
+      restoreCaretPosition(editor, caretPos-previousLen);
+      hideHoverMenu();
+      highlightMisspellings();
+    }
+
+    loadDictionary();
+  </script>
+</body>
+
+</html>
